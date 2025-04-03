@@ -3,153 +3,130 @@ import * as fs from "fs";
 import * as path from "path";
 import axios from "axios";
 
-function isIrrelevantFile(filePath: string): boolean {
-  const irrelevantDirs = ["node_modules", ".git", "__pycache__"];
-  const irrelevantExtensions = [".log", ".tmp"];
+// Configuration for file handling
+const IGNORED_DIRS = ["node_modules", ".git", "__pycache__", "dist", "build"];
+const IGNORED_EXTENSIONS = [
+  ".log",
+  ".tmp",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".pdf",
+  ".md"
+];
+const MAX_FILE_SIZE = 1024 * 1024; // 1MB
 
-  return (
-    irrelevantDirs.some((dir) => filePath.includes(dir)) ||
-    irrelevantExtensions.some((ext) => filePath.endsWith(ext))
+function isRelevantFile(filePath: string): boolean {
+  const normalizedPath = filePath.toLowerCase();
+
+  return !(
+    IGNORED_DIRS.some((dir) => normalizedPath.includes(dir.toLowerCase())) ||
+    IGNORED_EXTENSIONS.some((ext) => normalizedPath.endsWith(ext)) ||
+    fs.statSync(filePath).size > MAX_FILE_SIZE
   );
 }
 
-function getFilesInDirectory(directory: string): string[] {
-  let files: string[] = [];
+async function getCodeFiles(
+  rootDir: string
+): Promise<Array<{ path: string; content: string }>> {
+  const codeFiles: Array<{ path: string; content: string }> = [];
 
-  function traverseDir(dir: string) {
-    const items = fs.readdirSync(dir);
-    items.forEach((item) => {
-      const fullPath = path.join(dir, item);
-      const stats = fs.statSync(fullPath);
+  async function traverseDirectory(dir: string) {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
 
-      if (isIrrelevantFile(fullPath)) {
-        return;
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        if (isRelevantFile(fullPath)) {
+          await traverseDirectory(fullPath);
+        }
+      } else if (entry.isFile() && isRelevantFile(fullPath)) {
+        try {
+          const content = await fs.promises.readFile(fullPath, "utf-8");
+          codeFiles.push({
+            path: path.relative(rootDir, fullPath),
+            content: content,
+          });
+        } catch (error) {
+          console.warn(`Could not read file ${fullPath}: ${error}`);
+        }
       }
-
-      if (stats.isDirectory()) {
-        traverseDir(fullPath);
-      } else if (stats.isFile()) {
-        files.push(fullPath);
-      }
-    });
+    }
   }
 
-  traverseDir(directory);
-  return files;
+  await traverseDirectory(rootDir);
+  return codeFiles;
 }
 
-export function activate(context: vscode.ExtensionContext) {
-  let disposable = vscode.commands.registerCommand(
-    "extension.generateDocumentation",
-    async () => {
-      // Check if a workspace is open
-      if (
-        !vscode.workspace.workspaceFolders ||
-        vscode.workspace.workspaceFolders.length === 0
-      ) {
-        vscode.window.showErrorMessage(
-          "No workspace is open. Please open a folder to generate documentation."
-        );
-        console.error("Error: No workspace is open.");
+export async function activate(context: vscode.ExtensionContext) {
+  const commandId = "codeScribe.generateDocumentation";
+
+  const commands = await vscode.commands.getCommands();
+  if (!commands.includes(commandId)) {
+    const disposable = vscode.commands.registerCommand(commandId, async () => {
+      const workspace = vscode.workspace;
+
+      if (!workspace.workspaceFolders?.[0]) {
+        vscode.window.showErrorMessage("Please open a workspace folder first.");
         return;
       }
 
-      const workspaceFolder = vscode.workspace.workspaceFolders[0].uri.fsPath;
-      vscode.window.showInformationMessage(
-        "Generating documentation... Please wait."
+      const rootPath = workspace.workspaceFolders[0].uri.fsPath;
+      const statusBar = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Left
       );
 
       try {
-        const files = getFilesInDirectory(workspaceFolder);
+        statusBar.text = "$(sync~spin) Collecting code files...";
+        statusBar.show();
 
-        if (files.length === 0) {
-          vscode.window.showWarningMessage(
-            "No valid code files found to document."
-          );
-          console.warn("Warning: No valid code files found in the workspace.");
+        const codeFiles = await getCodeFiles(rootPath);
+
+        if (codeFiles.length === 0) {
+          vscode.window.showWarningMessage("No code files found to document.");
           return;
         }
 
-        const codeFiles = files.map((file) => ({
-          path: file,
-          content: fs.readFileSync(file, "utf-8"),
-        }));
+        statusBar.text = "$(sync~spin) Generating documentation...";
 
-        // Show a progress notification
-        vscode.window.withProgress(
+        const response = await axios.post(
+          "http://localhost:8000/document",
           {
-            location: vscode.ProgressLocation.Notification,
-            title: "Generating Documentation...",
-            cancellable: false,
+            codeFiles,
           },
-          async () => {
-            try {
-              console.log("Sending code files to backend...");
-              const response = await axios.post(
-                "http://localhost:8000/document",
-                { codeFiles }
-              );
-
-              // Save the documentation in the root folder
-              const docFilePath = path.join(
-                workspaceFolder,
-                "documentation.md"
-              );
-              fs.writeFileSync(
-                docFilePath,
-                response.data.documentation,
-                "utf-8"
-              );
-
-              vscode.window.showInformationMessage(
-                "Documentation generated successfully!"
-              );
-              console.log(
-                "Documentation successfully generated at:",
-                docFilePath
-              );
-
-              vscode.workspace
-                .openTextDocument(vscode.Uri.file(docFilePath))
-                .then((doc) => {
-                  vscode.window.showTextDocument(doc);
-                });
-            } catch (error: any) {
-              console.error("Error during API request:", error);
-              vscode.window.showErrorMessage(
-                `CodeScribe Error | Error Code: ${error.code}`
-              );
-
-              // Create a dummy documentation file for testing purposes
-              const dummyFilePath = path.join(workspaceFolder, "documentation.md");
-              const dummyContent = "# Documentation\n\nThis is a dummy file created because the backend is not running.";
-              fs.writeFileSync(dummyFilePath, dummyContent, "utf-8");
-
-              vscode.window.showInformationMessage(
-                "Backend not available. Dummy documentation file created."
-              );
-              console.log("Dummy documentation file created:", dummyFilePath);
-            }
+          {
+            timeout: 120000,
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+            },
           }
         );
-      } catch (error: any) {
-        console.error("Unexpected error:", error);
-        vscode.window.showErrorMessage(`Unexpected error: ${error.message}`);
 
-        // Create a dummy documentation file for testing purposes
-        const dummyFilePath = path.join(workspaceFolder, "documentation.md");
-        const dummyContent = "# Documentation\n\nThis is a dummy file created due to an unexpected error.";
-        fs.writeFileSync(dummyFilePath, dummyContent, "utf-8");
+        const docPath = path.join(rootPath, "CODE_DOCUMENTATION.md");
+        await fs.promises.writeFile(docPath, response.data.documentation);
 
         vscode.window.showInformationMessage(
-          "Unexpected error occurred. Dummy documentation file created."
+          "Documentation generated successfully!"
         );
-        console.log("Dummy documentation file created:", dummyFilePath);
-      }
-    }
-  );
+        vscode.window.showTextDocument(vscode.Uri.file(docPath));
+      } catch (error: any) {
+        console.error("Documentation generation failed:", error);
 
-  context.subscriptions.push(disposable);
+        const message =
+          error.response?.data?.detail ||
+          error.message ||
+          "Documentation generation failed";
+        vscode.window.showErrorMessage(`CodeScribe Error: ${message}`);
+      } finally {
+        statusBar.dispose();
+      }
+    });
+
+    context.subscriptions.push(disposable);
+  }
 }
 
 export function deactivate() {}

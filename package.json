@@ -4,6 +4,10 @@
   "description": "An AI tool that documents your codebase for you",
   "publisher": "pradyumna-deepak",
   "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YARE0909/CodeScribe-Extension.git"
+  },
   "engines": {
     "vscode": "^1.98.0"
   },
